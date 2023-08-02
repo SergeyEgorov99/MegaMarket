@@ -1,0 +1,121 @@
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackContext, Filters
+from jira import JIRA
+import sqlite3
+
+# Замените на свои данные
+TOKEN = '***'
+JIRA_SERVER = 'https://jira.goods.ru/'
+JIRA_USER = 'egorov'
+JIRA_PASSWORD = '***'
+
+jira = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_USER, JIRA_PASSWORD))
+
+chat_state = {}
+
+conn = sqlite3.connect('logins.db', check_same_thread=False)
+conn.execute('''
+CREATE TABLE IF NOT EXISTS chat_logins 
+(chat_id INT PRIMARY KEY, login TEXT)''')
+
+def get_login(chat_id):
+    cursor = conn.cursor()
+    cursor.execute("SELECT login FROM chat_logins WHERE chat_id = ?", (chat_id,))
+    login = cursor.fetchone()
+    return login[0] if login else None
+
+def save_login(chat_id, login):
+    conn.execute("INSERT OR REPLACE INTO chat_logins VALUES (?, ?)", (chat_id, login))
+    conn.commit()
+
+def start(update: Update, context: CallbackContext) -> None:
+    chat_id = update.message.chat_id
+    if not get_login(chat_id):
+        chat_state[chat_id] = {"stage": "login"}
+        update.message.reply_text('Введите свой логин в Jira:')
+    else:
+        update.message.reply_text('Привет! Для создания нового тикета Jira используйте команду /create_task')
+
+def create_task(update: Update, context: CallbackContext) -> None:
+    chat_id = update.message.chat_id
+    if not get_login(chat_id):
+        update.message.reply_text('Сначала нужно ввести логин в Jira с помощью команды /start')
+    else:
+        chat_state[chat_id] = {"stage": "choice"}
+        reply_keyboard = ReplyKeyboardMarkup([[KeyboardButton('Создать новую инструкцию')], 
+                                              [KeyboardButton('Обновить инструкцию')]], 
+                                             one_time_keyboard=True)
+        update.message.reply_text('Что вы хотите сделать?', reply_markup=reply_keyboard)
+
+def unknown_command(update: Update, context: CallbackContext) -> None:
+    context.bot.send_message(chat_id=update.effective_chat.id, text="Неизвестная команда. Используйте /start для ввода логина Jira или /create_task для создания задачи.")
+
+def process_message(update: Update, context: CallbackContext) -> None:
+    chat_id = update.message.chat_id
+
+    if chat_id not in chat_state:
+        return
+
+    data = chat_state[chat_id]
+
+    if data["stage"] == "login":
+        save_login(chat_id, update.message.text)
+        del data["stage"]
+        update.message.reply_text('Логин сохранен. Теперь вы можете создать задачу с помощью команды /create_task')
+    elif data["stage"] == "choice":
+        data["choice"] = update.message.text
+        data["stage"] = "title"
+        update.message.reply_text('Введите тему:')
+    elif data["stage"] == "title":
+        data["title"] = update.message.text
+        if data["choice"] == "Обновить инструкцию":
+            data["stage"] = "link"
+            update.message.reply_text('Введите ссылку на инструкцию:')
+        else:
+            data["stage"] = "description"
+            update.message.reply_text('Что нужно сделать?')
+    elif data["stage"] == "link":
+        data["link"] = update.message.text
+        data["stage"] = "description"
+        update.message.reply_text('Что нужно сделать?')
+    elif data["stage"] == "description":
+        data["description"] = update.message.text
+        del data["stage"]
+
+        if data["choice"] == "Обновить инструкцию":
+            description_text = f'*Ссылка:* {data["link"]}\n\n*Что нужно сделать:* {data["description"]}'
+            labels_choice = ['Обновление_инструкции_запрос']
+        else:
+            description_text = f'*Что нужно сделать:* {data["description"]}'
+            labels_choice = ['Новая_инструкция_запрос']
+
+        issue_dict = {
+            'project': {'key': 'ISD'},
+            'summary': data["title"],
+            'description': description_text,
+            'issuetype': {'name': 'История'},
+            'labels': labels_choice,
+            'reporter': {'name': get_login(chat_id)},
+        }
+
+        new_issue = jira.create_issue(issue_dict)
+        update.message.reply_text(f'Тикет Jira успешно создан: [{new_issue.key}]({JIRA_SERVER}browse/{new_issue.key})', parse_mode='Markdown')
+
+        del chat_state[chat_id]
+
+def main():
+    updater = Updater(TOKEN, use_context=True)
+
+    dispatcher = updater.dispatcher
+
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("create_task", create_task))
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, process_message))
+    dispatcher.add_handler(MessageHandler(Filters.command, unknown_command))
+
+    updater.start_polling()
+
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
